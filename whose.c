@@ -11,6 +11,7 @@ typedef struct Note {
   HWND handle;
   int id;
   int opened;
+  int changes;
   char filename[FILENAME_SIZE + 1];
   char preview[PREVIEW_SIZE + 1];
 } Note;
@@ -250,9 +251,7 @@ void FindNotesFromDisk(const char* path) {
     FILE* file = fopen(fullpath,"r");
     if(!file) continue;
 
-    Note* n = Push((Note){});
-    n->opened = 0;
-    n->id = NOTEID++;
+    Note* n = Push((Note){.opened = 0, .changes = 0, .id = NOTEID++});
     memcpy(n->filename,fd.cFileName,len);
     n->filename[FILENAME_SIZE] = '\0';
 
@@ -364,12 +363,22 @@ void ReadNoteTextFromDisk(const char* filepath, HWND textHandle, ssize_t offset)
   free(buffer);
 }
 
+void CloseNote(const char* filepath, HWND textHandle, Note* note) {
+  if(!note || !filepath || !textHandle) return;
+
+  if(note->changes) WriteNoteToDisk(filepath,textHandle);
+
+  note->changes = 0;
+  note->opened = 0;
+}
+
 LRESULT CALLBACK NoteWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
   WindowData* wd = (WindowData*)GetWindowLongPtr(hwnd,GWLP_USERDATA);
 
   switch(uMsg) {
     case WM_CLOSE: {
-      if(wd->textHandle) WriteNoteToDisk(wd->filepath,wd->textHandle);
+      Note* note = Find(wd->id);
+      CloseNote(wd->filepath,wd->textHandle,note);
       DestroyWindow(hwnd);
     } return 0;
 
@@ -413,6 +422,7 @@ LRESULT CALLBACK NoteWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
       else if(wmId == NOTE_EDIT_ID && msg == EN_CHANGE) {
         Note* note = Find(wd->id);
         UpdateNotePreview(note,wd->textHandle,MAIN_NOTELIST_HANDLE);
+        note->changes = 1;
       }
     } break;
   }
@@ -513,9 +523,7 @@ void CreateNewNoteAndAddToList(const char* notePath, HINSTANCE hInstance, HWND l
   SetForegroundWindow(wd->handle);
   SetFocus(wd->textHandle);
 
-  Note* n = Push((Note){});
-  n->opened = 1;
-  n->id = NOTEID++;
+  Note* n = Push((Note){.opened = 1, .changes = 1, .id = NOTEID++});
   memcpy(n->filename,filenameBuffer,FILENAME_SIZE + 1);
   n->handle = wd->handle;
   memcpy(n->preview,EMPTYNOTE_STRING,sizeof(EMPTYNOTE_STRING));
@@ -544,7 +552,15 @@ void OpenBySelection(HWND listHandle) {
 LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
   switch(uMsg) {
     case WM_CLOSE: {
-      PostQuitMessage(0);
+      // Write all open notes with changes to disk
+      for(int i = 0; i < noteArray.size; ++i) {
+        Note* note = &noteArray.data[i];
+        if(note->opened && note->changes) {
+          WindowData* wd = (WindowData*)GetWindowLongPtr(note->handle,GWLP_USERDATA);
+          WriteNoteToDisk(wd->filepath,wd->textHandle);
+          DestroyWindow(note->handle);
+        }
+      }
       DestroyWindow(hwnd);
     } return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
@@ -663,7 +679,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     NULL                                          // Pointer to window user data
   );
 
-  if(mainHandle == NULL) return 0;
+  if(mainHandle == NULL) return 1;
 
   int xStart = (STD_MAIN_WINDOWWIDTH-STD_BUTTONWIDTH-FISSURE);
 
