@@ -6,6 +6,7 @@
 
 #define PREVIEW_SIZE 32
 #define FILENAME_SIZE 14
+#define CONFIG_LEAST_SIZE 1
 
 typedef struct Note {
   HWND handle;
@@ -210,6 +211,18 @@ long GetSizeOfFile(FILE* f) {
   return size;
 }
 
+static inline long ConfigLength(FILE* f) {
+  int c;
+
+  fseek(f,0,SEEK_SET);
+
+  while((c = fgetc(f)) != EOF && c != '\n');
+  long len = fseek(f,0,SEEK_CUR);
+
+  fseek(f,0,SEEK_SET);
+  return len;
+}
+
 void PrepareNotesPath() {
   char userPath[MAX_PATH];
   DWORD len = GetEnvironmentVariable("USERPROFILE",userPath,MAX_PATH);
@@ -224,6 +237,24 @@ void PrepareNotesPath() {
 
   CreateDirectory(NOTESPATH,NULL); // Create dir if not exists
 }
+
+Note* InitNoteWithConfigFromDisk(FILE* f) {
+  long filelen = GetSizeOfFile(f);
+  long configLength = ConfigLength(f);
+  if(ConfigLength < CONFIG_LEAST_SIZE || configLength == filelen) assert(false && "false config");
+
+  int opened;
+  fread(&opened,1,1,f);       // Read was open?
+
+  Note* note = Push((Note){
+    .opened = opened, 
+    .changes = 0, 
+    .id = NOTEID++
+  });
+  return note;
+}
+
+void OpenNoteFromList(const char* filepath, HINSTANCE hInstance, HWND listHandle, int index);
 
 void FindNotesFromDisk(const char* path) {
   char searchBuffer[MAX_PATH] = {0};
@@ -251,14 +282,20 @@ void FindNotesFromDisk(const char* path) {
     FILE* file = fopen(fullpath,"r");
     if(!file) continue;
 
-    Note* n = Push((Note){.opened = 0, .changes = 0, .id = NOTEID++});
+    Note* n = InitNoteWithConfigFromDisk(file);
     memcpy(n->filename,fd.cFileName,len);
     n->filename[FILENAME_SIZE] = '\0';
 
     long fileLength = GetSizeOfFile(file);
+    long configLength = ConfigLength(file);
+
+    fileLength = fileLength - configLength;
+
+    // Read and set preview of note
     if(fileLength == 0) memcpy(n->preview,EMPTYNOTE_STRING,sizeof(EMPTYNOTE_STRING));
     else {
       if(fileLength > PREVIEW_SIZE) fileLength = PREVIEW_SIZE;
+      fseek(file,configLength + 1,SEEK_SET);
       fread(n->preview,1,fileLength,file);
       n->preview[PREVIEW_SIZE] = '\0';
     }
@@ -269,6 +306,11 @@ void FindNotesFromDisk(const char* path) {
 
     fclose(file);
 
+    // If they were open, open them now
+    if(n->opened)
+      OpenNoteFromList(fullpath,GetModuleHandle(NULL),MAIN_NOTELIST_HANDLE,index);
+
+    
   } while(FindNextFile(hfind,&fd));
 
   FindClose(hfind);
@@ -328,28 +370,36 @@ void UpdateNotePreview(Note* note, HWND textHandle, HWND listHandle) {
   }
 }
 
-void WriteNoteToDisk(const char* filepath, HWND textHandle) {
-  if(!filepath) return;
+void WriteNoteToDisk(const char* filepath, HWND textHandle, Note* note) {
+  if(!filepath || !textHandle || !note) return;
 
   int len = GetWindowTextLength(textHandle);
-  char* buffer = malloc(len + 1);
-  GetWindowText(textHandle,buffer,len + 1);
+  if(len <= 1) return;  // Empty note, do not write to disk
 
   FILE* f = fopen(filepath,"w");
-  if(!f) goto cleanup_return;
+  if(!f) return;
 
+  char* buffer = malloc(len + 1); // + NT
+  GetWindowText(textHandle,buffer,len + 1);
+
+  // 
+  // Write config 
+  // 
+  fputc(note->opened,f);         // Opened during exit?
+  // End config with new line
+  fputc('\n',f);
+
+  // 
+  // Write note text
+  // 
   fwrite(buffer,1,len,f);
-  fclose(f);
 
-cleanup_return:
+  fclose(f);
   free(buffer);
 }
 
-void ReadNoteTextFromDisk(const char* filepath, HWND textHandle, ssize_t offset) {
-  if(!filepath) return;
-
-  FILE* f = fopen(filepath,"r");
-  if(!f) return;
+void ReadNoteTextFromDisk(FILE* f, HWND textHandle, ssize_t offset) {
+  if(!f || !textHandle) return;
 
   long size = GetSizeOfFile(f) - offset;
   fsetpos(f,(fpos_t*)&offset);
@@ -366,7 +416,7 @@ void ReadNoteTextFromDisk(const char* filepath, HWND textHandle, ssize_t offset)
 void CloseNote(const char* filepath, HWND textHandle, Note* note) {
   if(!note || !filepath || !textHandle) return;
 
-  if(note->changes) WriteNoteToDisk(filepath,textHandle);
+  if(note->changes) WriteNoteToDisk(filepath,textHandle,note);
 
   note->changes = 0;
   note->opened = 0;
@@ -481,8 +531,13 @@ void OpenNoteFromList(const char* filepath, HINSTANCE hInstance, HWND listHandle
     return;
   }
 
-  ReadNoteTextFromDisk(filepath,wd->textHandle,0);
+  FILE* f = fopen(filepath,"r");
+  if(!f) return;
 
+  long configlen = ConfigLength(f);
+  ReadNoteTextFromDisk(f,wd->textHandle,configlen + 1);
+
+  note->changes = 1;
   note->handle = wd->handle;
   note->opened = 1;
   wd->id = id;
@@ -555,9 +610,9 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
       // Write all open notes with changes to disk
       for(int i = 0; i < noteArray.size; ++i) {
         Note* note = &noteArray.data[i];
-        if(note->opened && note->changes) {
+        if(note->changes) {
           WindowData* wd = (WindowData*)GetWindowLongPtr(note->handle,GWLP_USERDATA);
-          WriteNoteToDisk(wd->filepath,wd->textHandle);
+          WriteNoteToDisk(wd->filepath,wd->textHandle,note);
           DestroyWindow(note->handle);
         }
       }
