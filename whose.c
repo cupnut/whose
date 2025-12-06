@@ -6,13 +6,16 @@
 
 #define PREVIEW_SIZE 32
 #define FILENAME_SIZE 14
-#define CONFIG_LEAST_SIZE 1
+#define CONFIG_LEAST_SIZE 17
+
+static const unsigned char CONFIG_SEPARATOR = UCHAR_MAX;
 
 typedef struct Note {
   HWND handle;
   int id;
   int opened;
   int changes;
+  int x,y,width,height;
   char filename[FILENAME_SIZE + 1];
   char preview[PREVIEW_SIZE + 1];
 } Note;
@@ -26,8 +29,9 @@ typedef struct {
   HWND handle;
   HWND textHandle;
   HWND deleteButtonHandle;
-  char filepath[MAX_PATH + 1];
   int id;
+  int positionalChanges;
+  char filepath[MAX_PATH + 1];
 } WindowData;
 
 static char NOTESPATH[MAX_PATH + 1] = {0};
@@ -216,8 +220,8 @@ static inline long ConfigLength(FILE* f) {
 
   fseek(f,0,SEEK_SET);
 
-  while((c = fgetc(f)) != EOF && c != '\n');
-  long len = fseek(f,0,SEEK_CUR);
+  while((c = fgetc(f)) != EOF && c != CONFIG_SEPARATOR); 
+  long len = ftell(f);
 
   fseek(f,0,SEEK_SET);
   return len;
@@ -238,18 +242,44 @@ void PrepareNotesPath() {
   CreateDirectory(NOTESPATH,NULL); // Create dir if not exists
 }
 
+void RetrieveNoteWindowPosition(HWND noteWindowHandle, Note* note) {
+  WINDOWPLACEMENT wp = { sizeof(wp) };
+
+  if(!GetWindowPlacement(noteWindowHandle,&wp)) {
+    note->x = CW_USEDEFAULT;
+    note->y = CW_USEDEFAULT;
+    note->width = STD_NOTE_WINDOWWIDTH;
+    note->height = STD_NOTE_WINDOWHEIGHT;
+    return;
+  }
+
+  note->x = wp.rcNormalPosition.left;
+  note->y = wp.rcNormalPosition.top;
+  note->width = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+  note->height = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+}
+
 Note* InitNoteWithConfigFromDisk(FILE* f) {
   long filelen = GetSizeOfFile(f);
   long configLength = ConfigLength(f);
-  if(ConfigLength < CONFIG_LEAST_SIZE || configLength == filelen) assert(false && "false config");
+  if(configLength < CONFIG_LEAST_SIZE) assert(false && "config too small");
+  if(configLength == filelen)          assert(false && "config invalid");
 
-  int opened;
-  fread(&opened,1,1,f);       // Read was open?
+  int opened,x,y,width,height;
+  fread(&opened,1,1,f);                 // Was open?
+  fread(&x,sizeof(int),1,f);            // Coord X
+  fread(&y,sizeof(int),1,f);            // Coord Y
+  fread(&width,sizeof(int),1,f);        // Window width
+  fread(&height,sizeof(int),1,f);       // Window height
 
   Note* note = Push((Note){
+    .id = NOTEID++,
     .opened = opened, 
     .changes = 0, 
-    .id = NOTEID++
+    .x = x,
+    .y = y,
+    .width = width,
+    .height = height
   });
   return note;
 }
@@ -279,7 +309,7 @@ void FindNotesFromDisk(const char* path) {
     size_t len = strlen(fd.cFileName);
     if(len > FILENAME_SIZE) continue;
 
-    FILE* file = fopen(fullpath,"r");
+    FILE* file = fopen(fullpath,"rb");
     if(!file) continue;
 
     Note* n = InitNoteWithConfigFromDisk(file);
@@ -295,7 +325,7 @@ void FindNotesFromDisk(const char* path) {
     if(fileLength == 0) memcpy(n->preview,EMPTYNOTE_STRING,sizeof(EMPTYNOTE_STRING));
     else {
       if(fileLength > PREVIEW_SIZE) fileLength = PREVIEW_SIZE;
-      fseek(file,configLength + 1,SEEK_SET);
+      fseek(file,configLength,SEEK_SET);
       fread(n->preview,1,fileLength,file);
       n->preview[PREVIEW_SIZE] = '\0';
     }
@@ -376,7 +406,7 @@ void WriteNoteToDisk(const char* filepath, HWND textHandle, Note* note) {
   int len = GetWindowTextLength(textHandle);
   if(len <= 1) return;  // Empty note, do not write to disk
 
-  FILE* f = fopen(filepath,"w");
+  FILE* f = fopen(filepath,"wb");
   if(!f) return;
 
   char* buffer = malloc(len + 1); // + NT
@@ -385,13 +415,22 @@ void WriteNoteToDisk(const char* filepath, HWND textHandle, Note* note) {
   // 
   // Write config 
   // 
-  fputc(note->opened,f);         // Opened during exit?
+  fputc(note->opened,f);                    // Opened during exit?
+  fwrite(&note->x,sizeof(int),1,f);         // Coord X during exit
+  fwrite(&note->y,sizeof(int),1,f);         // Coord Y during exit
+  fwrite(&note->width,sizeof(int),1,f);     // Window width during exit
+  fwrite(&note->height,sizeof(int),1,f);    // Window height during exit
   // End config with new line
-  fputc('\n',f);
+  fputc(CONFIG_SEPARATOR,f);
 
   // 
-  // Write note text
+  // Convert and write note text
   // 
+  for(int i = 0, j = 0; i < len; ++i) {
+    if(buffer[i] == '\r' && buffer[i+1] == '\n') continue;
+    buffer[j++] = buffer[i];
+  }
+
   fwrite(buffer,1,len,f);
 
   fclose(f);
@@ -402,7 +441,7 @@ void ReadNoteTextFromDisk(FILE* f, HWND textHandle, ssize_t offset) {
   if(!f || !textHandle) return;
 
   long size = GetSizeOfFile(f) - offset;
-  fsetpos(f,(fpos_t*)&offset);
+  fseek(f,offset,SEEK_SET);
 
   char* buffer = malloc(size + 1);
   fread(buffer,1,size,f);
@@ -428,6 +467,14 @@ LRESULT CALLBACK NoteWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
   switch(uMsg) {
     case WM_CLOSE: {
       Note* note = Find(wd->id);
+      if(!note) assert(false && "this should not have happened");
+
+      if(wd->positionalChanges) { 
+        RetrieveNoteWindowPosition(wd->handle,note);
+        note->changes = 1; 
+        wd->positionalChanges = 0;
+      }
+
       CloseNote(wd->filepath,wd->textHandle,note);
       DestroyWindow(hwnd);
     } return 0;
@@ -440,6 +487,7 @@ LRESULT CALLBACK NoteWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
     case WM_SIZE: {
       int width = LOWORD(lParam);
       int height = HIWORD(lParam);
+      wd->positionalChanges = 1;
 
       // Reposition text box
       SetWindowPos(
@@ -480,12 +528,12 @@ LRESULT CALLBACK NoteWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
   return DefWindowProc(hwnd,uMsg,wParam,lParam);
 }
 
-void CreateStandardNoteComponents(WindowData* wd, HINSTANCE hInstance) {
+void CreateStandardNoteComponents(WindowData* wd, HINSTANCE hInstance, int x, int y, int width, int height) {
   // Create note window itself
   wd->handle = CreateWindowEx(
     0,NOTESCLASSNAME,"Hose_Note", 
     WS_OVERLAPPEDWINDOW, 
-    CW_USEDEFAULT,CW_USEDEFAULT,STD_NOTE_WINDOWWIDTH,STD_NOTE_WINDOWHEIGHT, 
+    x,y,width,height, 
     NULL,NULL,hInstance,wd
   );
 
@@ -496,7 +544,7 @@ void CreateStandardNoteComponents(WindowData* wd, HINSTANCE hInstance) {
   wd->textHandle = CreateWindowEx(
     0,"EDIT","",
     WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL,
-    0,0,STD_NOTE_WINDOWWIDTH,STD_NOTE_WINDOWHEIGHT - STD_BUTTONHEIGHT,
+    0,0,width,height - STD_BUTTONHEIGHT,
     wd->handle,(HMENU)NOTE_EDIT_ID,hInstance,NULL
   );
 
@@ -504,7 +552,7 @@ void CreateStandardNoteComponents(WindowData* wd, HINSTANCE hInstance) {
   wd->deleteButtonHandle = CreateWindowEx(
     0,"BUTTON","Delete",
     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-    10,STD_NOTE_WINDOWHEIGHT-STD_BUTTONHEIGHT,STD_BUTTONWIDTH,STD_BUTTONHEIGHT,
+    10,width-STD_BUTTONHEIGHT,STD_BUTTONWIDTH,STD_BUTTONHEIGHT,
     wd->handle,(HMENU)NOTE_DELETEBUTTON_ID,hInstance,NULL
   );
 }
@@ -517,9 +565,7 @@ void OpenNoteFromList(const char* filepath, HINSTANCE hInstance, HWND listHandle
   Note* note = Find(id);
   if(!note) return;
 
-  strcpy(wd->filepath,filepath);
-
-  CreateStandardNoteComponents(wd,hInstance);
+  CreateStandardNoteComponents(wd,hInstance,note->x,note->y,note->width,note->height);
   if(wd->handle == NULL) {
     free(wd);
     return;
@@ -531,16 +577,18 @@ void OpenNoteFromList(const char* filepath, HINSTANCE hInstance, HWND listHandle
     return;
   }
 
-  FILE* f = fopen(filepath,"r");
+  FILE* f = fopen(filepath,"rb");
   if(!f) return;
 
   long configlen = ConfigLength(f);
-  ReadNoteTextFromDisk(f,wd->textHandle,configlen + 1);
+  ReadNoteTextFromDisk(f,wd->textHandle,configlen);
 
   note->changes = 1;
   note->handle = wd->handle;
   note->opened = 1;
   wd->id = id;
+
+  strcpy(wd->filepath,filepath);
 
   SetWindowLongPtr(wd->handle,GWLP_USERDATA,(LONG_PTR)wd);
   ShowWindow(wd->handle,SW_SHOWNORMAL);
@@ -551,7 +599,7 @@ void CreateNewNoteAndAddToList(const char* notePath, HINSTANCE hInstance, HWND l
   WindowData* wd = malloc(sizeof(WindowData));
   if(!wd) return;
 
-  CreateStandardNoteComponents(wd, hInstance);
+  CreateStandardNoteComponents(wd, hInstance, CW_USEDEFAULT, CW_USEDEFAULT, STD_NOTE_WINDOWWIDTH, STD_NOTE_WINDOWHEIGHT);
   if(wd->handle == NULL) {
     free(wd);
     return;
@@ -583,6 +631,8 @@ void CreateNewNoteAndAddToList(const char* notePath, HINSTANCE hInstance, HWND l
   n->handle = wd->handle;
   memcpy(n->preview,EMPTYNOTE_STRING,sizeof(EMPTYNOTE_STRING));
 
+  RetrieveNoteWindowPosition(wd->handle,n);
+
   wd->id = n->id;
 
   int index = SendMessage(listHandle,LB_ADDSTRING,0,(LPARAM)n->preview);
@@ -612,7 +662,14 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         Note* note = &noteArray.data[i];
         if(note->changes) {
           WindowData* wd = (WindowData*)GetWindowLongPtr(note->handle,GWLP_USERDATA);
-          WriteNoteToDisk(wd->filepath,wd->textHandle,note);
+
+          if(wd->positionalChanges) {
+            RetrieveNoteWindowPosition(wd->handle,note);
+            note->changes = 1;
+            wd->positionalChanges = 0;
+          }
+
+          CloseNote(wd->filepath,wd->textHandle,note);
           DestroyWindow(note->handle);
         }
       }
